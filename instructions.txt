@@ -1,0 +1,6 @@
+i want to make a terminal based software first agter that we can modify it in web.
+the software is for automating the entry by giving it the pdf of the bank statement.
+so my requirement is that i give you the bank statement pdf and from that you give me the file which i can directly upload it to tally.
+i will give you bank statementin pdf format and entries on it will be of 1 year or less like entries for that accounting period only.
+so can we do it and later i also want to make this sofware extended for purchase and sales and other entries also first give for bank statement only.
+okay now the thing is i want to consil the ledgers say you had taken it on your know but now i want that i will give you  the pdf of the bank statement along with the ledgers of the account i have in that company that list contains only the name of the ledgers and you have to set the entries accordings to that ledgers and in uncertain cases where you don't get where to add this entry just add that entry in ledger A. here A ledger is supense ledger and for UPI and etc you have to see on your known where to send it say for example in phonepay ledger or else and also see if its a cash entry  add it to contra type
