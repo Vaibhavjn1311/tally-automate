@@ -93,11 +93,39 @@ def main():
                     xml_path = os.path.join(tmp_dir, "tally_import.xml")
                     csv_path = os.path.join(tmp_dir, "review_report.csv")
                     
-                    # For bank ledger detection, we just use a default or attempt to detect
+                    # --- Auto-detect Bank Ledger ---
+                    import pdfplumber
+                    import re
                     bank_ledger = "Bank Account"
-                    # Simple detection logic like in run_auto.py could be added here
+                    try:
+                        with pdfplumber.open(stmt_path, password=password) as pdf:
+                            # Extract text from the first page to find account number
+                            text = pdf.pages[0].extract_text() or ""
+                            # Look for typical account number patterns (10-16 digits)
+                            potential_acc_nos = re.findall(r'\b\d{10,16}\b', text)
+                            # Specifically look for "Account No" label
+                            acc_match = re.search(r'Account\s*No\s*[:.\\-]?\s*(\d+)', text, re.IGNORECASE)
+                            if acc_match:
+                                potential_acc_nos.insert(0, acc_match.group(1))
+                            
+                            for acc_no in potential_acc_nos:
+                                for led in master_ledgers:
+                                    if acc_no in led:
+                                        bank_ledger = led
+                                        break
+                                if bank_ledger != "Bank Account":
+                                    break
+                    except Exception:
+                        pass
+                    
+                    if bank_ledger != "Bank Account":
+                        st.info(f"🏦 Auto-detected Bank Ledger: **{bank_ledger}**")
+                    else:
+                        st.warning("⚠️ Could not auto-detect bank ledger. Using default: **Bank Account**")
+                    # -------------------------------
                     
                     generate_tally_xml(transactions, bank_ledger, xml_path)
+
                     generate_csv_report(transactions, bank_ledger, csv_path)
 
                     # Step 4: Download Buttons
