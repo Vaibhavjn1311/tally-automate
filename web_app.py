@@ -32,6 +32,12 @@ def main():
         if has_password:
             password = st.text_input("Enter PDF Password", type="password")
 
+        st.divider()
+        st.header("Date Range Filter")
+        st.info("Leave empty to process complete statement")
+        from_date = st.date_input("From Date", value=None)
+        to_date = st.date_input("To Date", value=None)
+
     col1, col2 = st.columns(2)
     
     with col1:
@@ -72,8 +78,32 @@ def main():
                         st.error("No transactions could be extracted. Please check the PDF format or password.")
                         return
 
+                    # --- Apply Date Filter ---
+                    if from_date or to_date:
+                        filtered_transactions = []
+                        for t in transactions:
+                            # t.date is a datetime object
+                            txn_date = t.date.date()
+                            
+                            include = True
+                            if from_date and txn_date < from_date:
+                                include = False
+                            if to_date and txn_date > to_date:
+                                include = False
+                                
+                            if include:
+                                filtered_transactions.append(t)
+                        
+                        if not filtered_transactions:
+                            st.warning("No transactions found in the selected date range.")
+                            return
+                            
+                        transactions = filtered_transactions
+                        st.info(f"Filtered to **{len(transactions)}** transactions between {from_date or 'Start'} and {to_date or 'End'}")
+                    # -------------------------
+
                     # Step 2: Display Results
-                    st.success(f"Successfully extracted {len(transactions)} transactions!")
+                    st.success(f"Successfully processed {len(transactions)} transactions!")
                     
                     # Create DataFrame for display
                     data = []
@@ -93,36 +123,63 @@ def main():
                     xml_path = os.path.join(tmp_dir, "tally_import.xml")
                     csv_path = os.path.join(tmp_dir, "review_report.csv")
                     
-                    # --- Auto-detect Bank Ledger ---
+                    # --- Enhanced Auto-detect Bank Ledger ---
                     import pdfplumber
                     import re
                     bank_ledger = "Bank Account"
                     try:
                         with pdfplumber.open(stmt_path, password=password) as pdf:
-                            # Extract text from the first page to find account number
-                            text = pdf.pages[0].extract_text() or ""
-                            # Look for typical account number patterns (10-16 digits)
-                            potential_acc_nos = re.findall(r'\b\d{10,16}\b', text)
-                            # Specifically look for "Account No" label
-                            acc_match = re.search(r'Account\s*No\s*[:.\\-]?\s*(\d+)', text, re.IGNORECASE)
-                            if acc_match:
-                                potential_acc_nos.insert(0, acc_match.group(1))
+                            # Extract text from the first few pages
+                            text = ""
+                            for pg in range(min(3, len(pdf.pages))):
+                                text += pdf.pages[pg].extract_text() or ""
                             
-                            for acc_no in potential_acc_nos:
+                            # 1. Find potential account number patterns (Full or Masked)
+                            # Matches: 1234567890 OR 123XXXXXX789 OR XXXXXX7890
+                            patterns = [
+                                r'\b\d{8,18}\b',                 # Full digits
+                                r'\b\d{2,6}[X*]{4,12}\d{2,6}\b', # Masked middle
+                                r'\b[X*]{4,12}\d{4,8}\b'         # Masked start
+                            ]
+                            
+                            found_patterns = []
+                            for p in patterns:
+                                found_patterns.extend(re.findall(p, text))
+                                
+                            # Also check specifically near "Account No"
+                            acc_match = re.search(r'Account\s*No\s*[:.\\-]?\s*([0-9X*]{8,20})', text, re.IGNORECASE)
+                            if acc_match:
+                                found_patterns.insert(0, acc_match.group(1))
+                            
+                            # 2. Match found patterns against master ledgers
+                            matched_ledger = None
+                            for p in found_patterns:
+                                # Clean pattern to get just the visible digits
+                                visible_parts = [v for v in re.split(r'[X*]+', p) if len(v) >= 3]
+                                
                                 for led in master_ledgers:
-                                    if acc_no in led:
-                                        bank_ledger = led
+                                    led_upper = led.upper()
+                                    # If it's a full number (no X), simple check
+                                    if 'X' not in p and '*' not in p:
+                                        if p in led_upper.replace(" ", ""):
+                                            matched_ledger = led
+                                            break
+                                    # If it's masked, check if ALL visible parts (>=3 chars) are in the ledger
+                                    elif visible_parts and all(part in led_upper.replace(" ", "") for part in visible_parts):
+                                        matched_ledger = led
                                         break
-                                if bank_ledger != "Bank Account":
+                                if matched_ledger:
+                                    bank_ledger = matched_ledger
                                     break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        st.warning(f"Error during ledger detection: {e}")
                     
                     if bank_ledger != "Bank Account":
                         st.info(f"🏦 Auto-detected Bank Ledger: **{bank_ledger}**")
                     else:
                         st.warning("⚠️ Could not auto-detect bank ledger. Using default: **Bank Account**")
                     # -------------------------------
+
                     
                     generate_tally_xml(transactions, bank_ledger, xml_path)
 

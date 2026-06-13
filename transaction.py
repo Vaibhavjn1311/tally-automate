@@ -204,12 +204,23 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
     nar_upper = narration.upper()
     nar_compact = re.sub(r'[^A-Z0-9]', '', nar_upper)
 
-    # 1. Cash Check -> Contra Voucher
+    # 1. Bank Charges Check (Priority over Cash/Contra)
+    is_charge = any(kw in nar_upper for kw in ['CHARGES', 'CHG', 'FEE', 'GST', 'TAX', 'COMMISSION', 'ANNUAL MAINTENANCE'])
+    if is_charge:
+        bank_charges_ledger = next((l for l in master_ledgers if l.upper() in ['BANK CHARGES', 'BANK CHARGE', 'CHARGES']), None)
+        if bank_charges_ledger:
+            return default_voucher, bank_charges_ledger
+        return default_voucher, a_ledger
+
+    # 2. Cash Check -> Contra Voucher (Only for pure cash movement)
     is_cash = False
+    # If it contains "CHARGES" or "CHG", it was already handled above.
     if any(kw in nar_compact for kw in ['CASHWDL', 'CASHDEP', 'CASHPOSIT', 'CASHWITH', 'BYCASH', 'TOCASH', 'ATMCASH', 'ATMWDL', 'CASH8845SELF', 'CASHDEPOSIT', 'CASHDEPOSITBY', 'ATMTXN', 'ATMDEBIT']):
         is_cash = True
     elif 'CASH' in nar_compact:
-        is_cash = True
+        # Avoid marking as cash if it's a "CASHBACK" or similar unless it's clearly a deposit/withdrawal
+        if 'CASHBACK' not in nar_upper:
+            is_cash = True
     elif is_debit and 'SELF' in nar_compact:
         is_cash = True
 
@@ -218,7 +229,7 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
         if cash_ledger:
             return 'Contra', cash_ledger
 
-    # 2. PhonePe / UPI Check -> Map to 'Phone Pyee' ONLY if it is a strong match. 
+    # 3. PhonePe / UPI Check -> Map to 'Phone Pyee' ONLY if it is a strong match. 
     # To prevent over-matching, we can make this more restrictive or remove automatic mapping if desired.
     # The user specifically requested not to default payments to these ledgers.
     # We will ONLY map if narration contains 'PHONEPE' OR 'UPI', but restrict it to non-payment types if necessary,
