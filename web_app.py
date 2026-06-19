@@ -155,19 +155,36 @@ def main():
                             matched_ledger = None
                             for p in found_patterns:
                                 # Clean pattern to get just the visible digits
-                                visible_parts = [v for v in re.split(r'[X*]+', p) if len(v) >= 3]
+                                # Split by X or * and keep parts with at least 3 digits
+                                parts = re.split(r'[X*]+', p)
+                                visible_parts = [v for v in parts if v and len(v) >= 3]
                                 
                                 for led in master_ledgers:
-                                    led_upper = led.upper()
-                                    # If it's a full number (no X), simple check
+                                    led_clean = re.sub(r'[^0-9]', '', led)
+                                    if not led_clean: continue
+                                    
+                                    # If it's a full number (no X or *), simple check
                                     if 'X' not in p and '*' not in p:
-                                        if p in led_upper.replace(" ", ""):
+                                        if p in led_clean:
                                             matched_ledger = led
                                             break
-                                    # If it's masked, check if ALL visible parts (>=3 chars) are in the ledger
-                                    elif visible_parts and all(part in led_upper.replace(" ", "") for part in visible_parts):
-                                        matched_ledger = led
-                                        break
+                                    else:
+                                        # If it's masked, we need to be more careful
+                                        # 1. If it's masked at the start (e.g., XXXXXX7890)
+                                        if (p.startswith('X') or p.startswith('*')) and not (p.endswith('X') or p.endswith('*')):
+                                            last_digits = parts[-1]
+                                            if len(last_digits) >= 4 and led_clean.endswith(last_digits):
+                                                matched_ledger = led
+                                                break
+                                        
+                                        # 2. If it has visible parts at both ends (e.g., 123XXXX789)
+                                        elif visible_parts and all(part in led_clean for part in visible_parts):
+                                            # Ensure they appear in the correct relative order
+                                            regex_pattern = '.*'.join(visible_parts)
+                                            if re.search(regex_pattern, led_clean):
+                                                matched_ledger = led
+                                                break
+                                                
                                 if matched_ledger:
                                     bank_ledger = matched_ledger
                                     break

@@ -16,7 +16,7 @@ from ledger_extractor import extract_ledger_names
 console = Console()
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-PDF_PATH      = "OpTransactionHistoryUX502-06-2026.pdf"
+PDF_PATH      = "OpTransactionHistoryUX513-06-2026.pdf"
 PDF_PASSWORD  = None 
 MASTER_PDF    = "Master.pdf"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -36,30 +36,13 @@ if not transactions:
     console.print("[bold red]❌ No transactions could be extracted from the PDF.[/]")
     raise SystemExit(1)
 
-# 3. Auto-detect bank ledger (Same as main.py)
-import pdfplumber
-detected_bank_ledger = "Bank Account"
-try:
-    with pdfplumber.open(PDF_PATH, password=PDF_PASSWORD) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        potential_acc_nos = re.findall(r'\b\d{10,16}\b', text)
-        acc_match = re.search(r'Account\s*No\s*[:.\\-]?\s*(\d+)', text, re.IGNORECASE)
-        if acc_match:
-            potential_acc_nos.insert(0, acc_match.group(1))
-        for acc_no in potential_acc_nos:
-            for led in master_ledgers:
-                if acc_no in led:
-                    detected_bank_ledger = led
-                    break
-            if detected_bank_ledger != "Bank Account":
-                break
-except Exception:
-    pass
+# 3. Auto-detect bank ledger
+from ledger_extractor import detect_bank_ledger
+detected_bank_ledger = detect_bank_ledger(PDF_PATH, master_ledgers, password=PDF_PASSWORD)
 
 if detected_bank_ledger != "Bank Account":
     console.print(f"\n  🏦 Auto-detected Bank Ledger: [bold cyan]{detected_bank_ledger}[/]")
 else:
-    detected_bank_ledger = "Bank Account"
     console.print(f"\n  🏦 Using default Bank Ledger: [bold cyan]{detected_bank_ledger}[/]")
 
 # 4. Display summary

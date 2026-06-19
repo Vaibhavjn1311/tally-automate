@@ -6,6 +6,28 @@ from rich.console import Console
 
 console = Console()
 
+def clean_narration_amount(narration: str, amount: float = None, balance: float = None) -> str:
+    """Clean transaction amount and balance patterns from narration."""
+    # Remove balance and amount strings
+    pattern = r'\b[\d,]+\.\d{2}(?:[Cc][Rr]|[Dd][Rr])?\b'
+    if amount is not None:
+        amount_str_1 = f"{amount:,.2f}"
+        amount_str_2 = f"{amount:.2f}"
+        narration = narration.replace(amount_str_1, '').replace(amount_str_2, '')
+        
+    if balance is not None:
+        balance_str_1 = f"{balance:,.2f}"
+        balance_str_2 = f"{balance:.2f}"
+        narration = narration.replace(balance_str_1, '').replace(balance_str_2, '')
+        
+    narration = re.sub(pattern, '', narration)
+    
+    # Clean UTR or check endings or colons
+    narration = re.sub(r'\s*:\s*\d{12}\s*$', '', narration)
+    narration = re.sub(r'\s*:\s*$', '', narration)
+    narration = re.sub(r'\s+', ' ', narration).strip()
+    return narration
+
 def parse_bank_statement_bob(pdf_path: str, password: str = None, master_ledgers: List[str] = None) -> List[Transaction]:
     """Robust line-by-line block parser for Bank of Baroda statement format."""
     console.print(f"\n[bold]📂 Parsing BOB PDF (Block Mode):[/] {pdf_path}")
@@ -16,110 +38,173 @@ def parse_bank_statement_bob(pdf_path: str, password: str = None, master_ledgers
             text = page.extract_text()
             if text:
                 all_lines.extend(text.split('\n'))
+                
+    blocks = []
+    current_block = []
     
-    # 1. Identify lines starting with two dates (Transaction Headers)
-    header_indices = []
-    for i, line in enumerate(all_lines):
-        # BOB specific: Starts with DD/MM/YYYY DD/MM/YYYY
-        if re.match(r'^\d{2}/\d{2}/\d{4}\s+\d{2}/\d{2}/\d{4}', line.strip()):
-            header_indices.append(i)
+    footer_keywords = ['PAGE', 'CONTACT-US', 'COMPUTER-GENERATED', 'PAGE 1 OF', 'PAGE 2 OF', 'PAGE 3 OF', 'PAGE 4 OF']
+    header_keywords = [
+        'MAIN ACCOUNT', 'JOINT ACCOUNT', 'CUSTOMER ID:', 'BRANCH NAME:', 
+        'YOUR ACCOUNT STATEMENT', 'STATEMENT OF TRANSACTIONS', 
+        'TRAN DATE VALUE DATE', 'ACCOUNT -'
+    ]
+    
+    for line in all_lines:
+        line_strip = line.strip()
+        if not line_strip:
+            continue
             
-    if not header_indices:
-        console.print("[bold red]❌ No transaction headers found in BOB PDF.[/]")
-        return []
+        if line_strip.startswith('*'):
+            continue
+            
+        date_match = re.match(r'^(\d{2}/\d{2}/\d{4})', line_strip)
+        if date_match:
+            upper_line = line_strip.upper()
+            if any(kw in upper_line for kw in footer_keywords) or any(kw in upper_line for kw in header_keywords):
+                continue
+                
+            rest = line_strip[10:].strip()
 
-    transactions = []
+            # Check for a closing balance at the end of the line
+            has_closing_balance = bool(
+                re.search(r'[\d,]+\.\d{2}(?:Cr|Dr|CR|DR)$', line_strip, re.IGNORECASE)
+            )
+
+            # A pure value-date continuation: date followed only by an amount
+            # (no letters) and no closing balance marker
+            rest_is_only_amount = bool(rest) and not re.search(r'[A-Za-z]', rest)
+
+            if has_closing_balance:
+                # Genuine new-transaction header line
+                if current_block:
+                    blocks.append(current_block)
+                current_block = [line_strip]
+            elif rest_is_only_amount or not rest:
+                # Value-date line or bare date: continuation of current block
+                if current_block:
+                    current_block.append(line_strip)
+            else:
+                # Date-prefixed narration continuation (no closing balance)
+                # → belongs to the CURRENT block, not a new one
+                if current_block:
+                    current_block.append(line_strip)
+                # If there is no current block yet, start one (edge case)
+                else:
+                    current_block = [line_strip]
+        else:
+            if current_block:
+                upper_line = line_strip.upper()
+                if any(kw in upper_line for kw in footer_keywords) or any(kw in upper_line for kw in header_keywords):
+                    continue
+                current_block.append(line_strip)
+                
+    if current_block:
+        blocks.append(current_block)
+        
+    transactions_raw = []
     
-    # Process each header block
-    for i in range(len(header_indices)):
-        start_idx = header_indices[i]
-        # The block for transaction i ends at the next header line
-        end_idx = header_indices[i+1] if i+1 < len(header_indices) else len(all_lines)
-        
-        block = all_lines[start_idx:end_idx]
-        header_line = block[0]
-        
-        # Basic info from header line
-        match = re.match(r'^(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+(.*)', header_line.strip())
-        if not match: continue
-        
-        date_str, val_date_str, narration_start = match.groups()
+    for idx, block in enumerate(blocks):
+        first_line = block[0]
+        date_str = first_line[:10]
         date = parse_date(date_str)
         
-        # Balance BEFORE/AFTER logic:
-        # Balance on current header line is actually the closing balance of the PREVIOUS transaction.
-        # Balance of CURRENT transaction is on the NEXT header line.
-        
-        curr_line_amounts = re.findall(r'[\d,]+\.\d{2}Cr?|[\d,]+\.\d{2}Dr?', header_line)
-        opening_bal = clean_amount(curr_line_amounts[-1]) if curr_line_amounts else 0.0
-        
-        closing_bal = 0.0
-        if i + 1 < len(header_indices):
-            next_header_line = all_lines[header_indices[i+1]]
-            next_amounts = re.findall(r'[\d,]+\.\d{2}Cr?|[\d,]+\.\d{2}Dr?', next_header_line)
-            if next_amounts:
-                closing_bal = clean_amount(next_amounts[-1])
-        
-        # Transaction amount is found in the block (excluding the balance in the header line)
-        txn_amount = 0.0
+        bal_match = re.search(r'([\d,]+\.\d{2}Cr|[\d,]+\.\d{2}Dr|[\d,]+\.\d{2}CR|[\d,]+\.\d{2}DR)$', first_line.strip(), re.IGNORECASE)
+        balance = 0.0
+        if bal_match:
+            balance = clean_amount(bal_match.group(1))
+        else:
+            all_numbers = re.findall(r'[\d,]+\.\d{2}', first_line)
+            if all_numbers:
+                balance = clean_amount(all_numbers[-1])
+                
+        narration_parts = []
         for line_idx, line in enumerate(block):
-            # Skip the known balance in the first line
+            line_clean = line
+            line_clean = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', line_clean)
+            if line_idx == 0 and bal_match:
+                line_clean = line_clean.replace(bal_match.group(1), '')
+            line_clean = line_clean.strip()
+            if line_clean:
+                narration_parts.append(line_clean)
+                
+        narration = " ".join(narration_parts)
+        
+        transactions_raw.append({
+            'date': date,
+            'narration': narration,
+            'balance': balance,
+            'block': block
+        })
+
+    # Now calculate Debit/Credit using balance transition (reverse chronological order)
+    parsed_transactions = []
+    for i in range(len(transactions_raw)):
+        txn = transactions_raw[i]
+        block = txn['block']
+        
+        all_block_numbers = []
+        for line_idx, line in enumerate(block):
             search_line = line
-            if line_idx == 0 and curr_line_amounts:
-                search_line = line.replace(curr_line_amounts[-1], '')
+            search_line = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', search_line)
+            if line_idx == 0:
+                bal_match = re.search(r'([\d,]+\.\d{2}Cr|[\d,]+\.\d{2}Dr|[\d,]+\.\d{2}CR|[\d,]+\.\d{2}DR)$', line.strip(), re.IGNORECASE)
+                if bal_match:
+                    search_line = search_line.replace(bal_match.group(1), '')
+                else:
+                    nums = re.findall(r'[\d,]+\.\d{2}', search_line)
+                    if nums:
+                        search_line = search_line.replace(nums[-1], '')
             
             nums = re.findall(r'[\d,]+\.\d{2}', search_line)
-            if nums:
-                # The first number found that is not the opening balance
-                txn_amount = clean_amount(nums[0])
-                break
+            for n in nums:
+                all_block_numbers.append(clean_amount(n))
+                
+        block_amount = all_block_numbers[0] if all_block_numbers else 0.0
         
-        # If txn_amount is still 0, maybe it's on the header line but we replaced it?
-        # Re-check header line for ANY other numbers if txn_amount is 0
-        if txn_amount == 0.0 and len(curr_line_amounts) > 1:
-            txn_amount = clean_amount(curr_line_amounts[0])
-
-        # Determine type
-        # The statement is in REVERSE CHRONOLOGICAL order.
-        # current header line balance (opening_bal) is the closing balance of the LATEST transaction.
-        # next header line balance (closing_bal) is the closing balance of the PRECEDING transaction.
-        # So: if current_bal < preceding_bal -> DECREASE -> Payment (Debit).
-        # if current_bal > preceding_bal -> INCREASE -> Receipt (Credit).
-        
-        is_debit = False
-        if closing_bal != 0.0 and opening_bal != 0.0:
-            is_debit = opening_bal < closing_bal
-            # Use delta for amount accuracy
-            txn_amount = abs(opening_bal - closing_bal)
+        if i < len(transactions_raw) - 1:
+            next_txn = transactions_raw[i + 1]
+            diff = txn['balance'] - next_txn['balance']
+            if abs(diff) > 0.01:
+                is_debit = diff < 0
+                txn_amount = abs(diff)
+            else:
+                is_debit = block_amount > 0 and len(block) > 1
+                txn_amount = block_amount
         else:
-            # Fallback keywords if one balance is missing
-            debit_keywords = ['DR', 'WITHDRAWAL', 'CHARGES', 'PAID', 'BILL', 'NEFT-DR', 'RTGS-DR', 'IMPS-DR']
-            full_block_text = " ".join(block).upper()
-            is_debit = any(kw in full_block_text for kw in debit_keywords)
+            is_debit = False
+            has_num_on_later_lines = False
+            for line_idx, line in enumerate(block[1:], 1):
+                clean_line = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', line)
+                if re.findall(r'[\d,]+\.\d{2}', clean_line):
+                    has_num_on_later_lines = True
+                    break
+            
+            if has_num_on_later_lines:
+                is_debit = True
+            else:
+                is_debit = any(kw in txn['narration'].upper() for kw in ['NEFT', 'RTGS', 'WITHDRAWAL', 'DEBIT', 'CHARGES'])
+                
+            txn_amount = block_amount
             
         debit = txn_amount if is_debit else 0.0
         credit = txn_amount if not is_debit else 0.0
         
-        narration = clean_narration(" ".join(block))
-        # Remove amounts from narration to keep it clean
-        for amt_str in re.findall(r'[\d,]+\.\d{2}Cr?|[\d,]+\.\d{2}Dr?', narration):
-            narration = narration.replace(amt_str, '')
-        narration = clean_narration(narration)
-
+        cleaned_nar = clean_narration_amount(txn['narration'], amount=txn_amount, balance=txn['balance'])
+        
         if master_ledgers:
-            voucher_type, contra_ledger = reconcile_transaction(narration, is_debit, master_ledgers, amount=txn_amount)
+            voucher_type, contra_ledger = reconcile_transaction(cleaned_nar, is_debit, master_ledgers, amount=txn_amount)
         else:
             voucher_type = "Payment" if is_debit else "Receipt"
             contra_ledger = "A"
             
-        transactions.append(Transaction(
-            date=date,
-            narration=narration,
+        parsed_transactions.append(Transaction(
+            date=txn['date'],
+            narration=cleaned_nar,
             debit=debit,
             credit=credit,
-            balance=closing_bal or opening_bal, # Fallback
+            balance=txn['balance'],
             voucher_type=voucher_type,
             contra_ledger=contra_ledger
         ))
         
-    return transactions
+    return parsed_transactions

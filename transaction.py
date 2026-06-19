@@ -306,7 +306,13 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
     if best_match and max_score >= 80:
         return default_voucher, best_match
 
-    # 4. Default Fallback -> Ledger "A" (Suspense)
+    # 4. UPI/Digital Payment Fallback -> Phone Pyee
+    if any(kw in nar_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'UPI', 'MBK', 'GPAY', 'PAYTM', 'IMPS']):
+        phone_led = next((l for l in master_ledgers if l.upper() in ['PHONE PYEE', 'PHONEPE', 'PHONE PAY', 'PHONEPE PRIVATELIMI']), None)
+        if phone_led:
+            return default_voucher, phone_led
+
+    # 5. Default Fallback -> Ledger "A" (Suspense)
     return default_voucher, a_ledger
 
 

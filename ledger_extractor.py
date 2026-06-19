@@ -84,3 +84,72 @@ def extract_ledger_names(pdf_path: str) -> list[str]:
         print(f"Error extracting ledgers: {e}")
 
     return sorted(list(set(ledgers)))
+
+
+def detect_bank_ledger(pdf_path: str, master_ledgers: list[str], password: str = None) -> str:
+    """
+    Detects the bank account number from the statement PDF
+    and matches it to one of the master ledgers.
+    """
+    if not master_ledgers:
+        return "Bank Account"
+        
+    try:
+        with pdfplumber.open(pdf_path, password=password or "") as pdf:
+            text = pdf.pages[0].extract_text() or ""
+            
+            acc_match = re.search(r'Account\s*(?:No)?\s*[:.\-]?\s*([0-9Xx\*\-]+)', text, re.IGNORECASE)
+            potential_acc_nos = []
+            if acc_match:
+                potential_acc_nos.append(acc_match.group(1).strip())
+                
+            masked_matches = re.findall(r'\b[0-9Xx\*\-]{10,18}\b', text)
+            for m in masked_matches:
+                if m not in potential_acc_nos:
+                    potential_acc_nos.append(m)
+                    
+            standard_digits = re.findall(r'\b\d{10,16}\b', text)
+            for d in standard_digits:
+                if d not in potential_acc_nos:
+                    potential_acc_nos.append(d)
+            
+            matches = []
+            for raw_acc in potential_acc_nos:
+                acc_clean = raw_acc.upper().replace('X', r'\d').replace('*', r'\d').replace('-', '')
+                
+                try:
+                    regex = re.compile(acc_clean)
+                    for led in master_ledgers:
+                        led_clean = re.sub(r'[^0-9A-Za-z]', '', led)
+                        if regex.search(led_clean):
+                            matches.append(led)
+                except Exception:
+                    pass
+                    
+                if not matches:
+                    digits_only = ''.join(re.findall(r'\d+', raw_acc))
+                    if len(digits_only) >= 6:
+                        start_dig = digits_only[:3]
+                        end_dig = digits_only[-3:]
+                        for led in master_ledgers:
+                            led_digs = ''.join(re.findall(r'\d+', led))
+                            if led_digs.startswith(start_dig) and led_digs.endswith(end_dig):
+                                matches.append(led)
+                                
+                if not matches:
+                    if digits_only:
+                        for led in master_ledgers:
+                            led_digs = ''.join(re.findall(r'\d+', led))
+                            if led_digs and (digits_only in led_digs or led_digs in digits_only):
+                                matches.append(led)
+            
+            if matches:
+                # Sort matches: prefer those starting with 'BOB ' (with space) or without '-'
+                # to avoid choosing header metadata like 'BOB -11960200000154'
+                matches_sorted = sorted(list(set(matches)), key=lambda x: (not x.startswith('BOB '), '-' in x, len(x)))
+                return matches_sorted[0]
+                            
+    except Exception as e:
+        print(f"Error detecting bank ledger: {e}")
+        
+    return "Bank Account"

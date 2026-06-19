@@ -155,31 +155,11 @@ def main():
         sys.exit(1)
 
     # ─── Step 1.5: Auto-detect Bank Ledger ────────────────────────────
-    detected_bank_ledger = "Bank Account"
-    if master_ledgers:
-        import pdfplumber
-        try:
-            with pdfplumber.open(pdf_path, password=pdf_password) as pdf:
-                text = pdf.pages[0].extract_text() or ""
-                potential_acc_nos = re.findall(r'\b\d{10,16}\b', text)
-                acc_match = re.search(r'Account\s*No\s*[:.\-]?\s*(\d+)', text, re.IGNORECASE)
-                if acc_match:
-                    potential_acc_nos.insert(0, acc_match.group(1))
-                
-                found = False
-                for acc_no in potential_acc_nos:
-                    for led in master_ledgers:
-                        if acc_no in led:
-                            detected_bank_ledger = led
-                            found = True
-                            break
-                    if found: break
-        except Exception:
-            pass
+    from ledger_extractor import detect_bank_ledger
+    detected_bank_ledger = detect_bank_ledger(pdf_path, master_ledgers, password=pdf_password)
 
     if detected_bank_ledger != "Bank Account":
         console.print(f"  🏦 [bold green]Success![/] Auto-detected Bank Ledger: [bold cyan]{detected_bank_ledger}[/]")
-        # Force the bank_ledger to the detected one as requested by the user
         bank_ledger = detected_bank_ledger
     else:
         bank_ledger = Prompt.ask(

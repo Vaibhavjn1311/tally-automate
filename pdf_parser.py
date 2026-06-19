@@ -167,86 +167,88 @@ def is_multiline_cell_format(table: List[List[str]]) -> bool:
 
 def split_multiline_narration(narration_lines: List[str], date_lines: List[str]) -> List[str]:
     """
-    Match narration lines to dates. Narrations can span multiple lines due to 
+    Match narration lines to dates. Narrations can span multiple lines due to
     wrapping, so we need to merge continuation lines with their parent narration.
-    
-    A narration line is a "new" narration if the corresponding date line exists.
-    Otherwise, it's a continuation of the previous narration.
+
+    Key guarantee: exactly len(date_lines) narration strings are returned, and
+    no narration text ever leaks into an adjacent transaction's slot.
     """
     if len(date_lines) == len(narration_lines):
         return narration_lines
 
-    # We need to figure out which narration lines belong together
-    # Strategy: Use dates as anchors. Each date starts a new transaction.
-    # Count dates to know expected number of transactions.
     num_transactions = len(date_lines)
+    cleaned = [l.strip() for l in narration_lines if l.strip()]
 
-    # Try to match narrations by checking if line starts look like new entries
-    # (not continuation of wrapped text)
-    merged = []
-    current = ""
+    if not cleaned:
+        return ["No Description"] * num_transactions
 
-    for line in narration_lines:
-        line = line.strip()
-        if not line:
-            continue
+    # Fewer or equal lines than transactions — 1-to-1 map, pad the rest
+    if len(cleaned) <= num_transactions:
+        result = list(cleaned)
+        result.extend(["No Description"] * (num_transactions - len(result)))
+        return result
 
-        # Heuristic: a new narration typically starts with known patterns
-        is_new_entry = False
+    # More narration lines than transactions — must merge continuations.
+    # Extended set of known transaction-start prefixes:
+    new_entry_patterns = [
+        r'^UPI[-\s]',       r'^NEFT',           r'^RTGS',
+        r'^IMPS',           r'^ATM',            r'^SETTLEMENT',
+        r'^UPISETTLEMENT',  r'^\d+TERMINAL',    r'^EDCRENTAL',
+        r'^SOUNDBOXRENTAL', r'^INT\.?PAY',      r'^CHQ',
+        r'^CASH',           r'^FT-',            r'^BY\s',
+        r'^TO\s',           r'^CLG',            r'^NACH',
+        r'^ECS',            r'^SI-',            r'^PFMS',
+        r'^ACHCR',          r'^MBK',            r'^BY\s+INST',
+        r'^BY\s+DD',        r'^BY\s+CASH',      r'^CHARGES',
+        r'^INT\s',          r'^SME\s',          r'^SALARY',
+        r'^TRF',            r'^POS\s',          r'^DR\s',
+    ]
 
-        # Check if this looks like the start of a new transaction narration
-        new_entry_patterns = [
-            r'^UPI[-\s]',           # UPI transaction
-            r'^NEFT',               # NEFT
-            r'^RTGS',               # RTGS
-            r'^IMPS',               # IMPS
-            r'^ATM',                # ATM
-            r'^SETTLEMENT',         # Settlement
-            r'^UPISETTLEMENT',      # UPI Settlement
-            r'^\d+TERMINAL',        # Card settlement
-            r'^EDCRENTAL',          # EDC Rental
-            r'^SOUNDBOXRENTAL',     # Soundbox Rental
-            r'^INT\.?PAY',          # Interest payment
-            r'^CHQ',                # Cheque
-            r'^CASH',               # Cash
-            r'^FT-',                # Fund transfer
-            r'^BY\s',               # By transfer
-            r'^TO\s',               # To transfer
-            r'^CLG',                # Clearing
-            r'^NACH',               # NACH
-            r'^ECS',                # ECS
-            r'^SI-',                # Standing instruction
-        ]
-
+    def looks_like_new_entry(line: str) -> bool:
         for pat in new_entry_patterns:
             if re.match(pat, line, re.IGNORECASE):
-                is_new_entry = True
-                break
+                return True
+        return False
 
-        # If we haven't reached expected count and this looks new, start new entry
-        if is_new_entry or len(merged) == 0:
-            if current:
-                merged.append(current)
-            current = line
+    result = []         # completed narration slots
+    current_parts = []  # parts accumulating for the current slot
+
+    for idx, line in enumerate(cleaned):
+        lines_after = len(cleaned) - idx - 1
+        slots_left = num_transactions - len(result)
+
+        # Hard constraint: once we're on the last slot, absorb everything into it
+        on_last_slot = (slots_left <= 1)
+
+        # Forced new entry: not enough lines remain to give every pending slot
+        # at least one line unless we start a new slot right now
+        forced_new = (not on_last_slot) and (lines_after < slots_left - 1)
+
+        if not current_parts:
+            current_parts.append(line)
+        elif on_last_slot:
+            current_parts.append(line)
+        elif forced_new or looks_like_new_entry(line):
+            result.append(" ".join(current_parts))
+            current_parts = [line]
         else:
-            # Continuation of previous narration
-            current = current + " " + line if current else line
+            current_parts.append(line)
 
-    if current:
-        merged.append(current)
+    # Close the last open slot
+    if current_parts:
+        if len(result) < num_transactions:
+            result.append(" ".join(current_parts))
+        else:
+            result[-1] = result[-1] + " " + " ".join(current_parts)
 
-    # If merged count matches dates, great!
-    if len(merged) == num_transactions:
-        return merged
+    # Safety: pad or merge tail into last slot (never drop text)
+    while len(result) < num_transactions:
+        result.append("No Description")
+    if len(result) > num_transactions:
+        tail = " ".join(result[num_transactions - 1:])
+        result = result[:num_transactions - 1] + [tail]
 
-    # Fallback: if count doesn't match, just return what we have
-    # and pad/truncate to match date count
-    if len(merged) < num_transactions:
-        merged.extend(["No Description"] * (num_transactions - len(merged)))
-    elif len(merged) > num_transactions:
-        merged = merged[:num_transactions]
-
-    return merged
+    return result
 
 
 def parse_multiline_amounts(amount_cell: str, num_transactions: int) -> List[float]:
@@ -583,6 +585,21 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
     if master_ledgers:
         console.print(f"  📚 Using [bold cyan]{len(master_ledgers)}[/] master ledgers for reconciliation")
 
+    # Detect and route BOB statements
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path, password=password or "") as pdf:
+            if pdf.pages:
+                text = pdf.pages[0].extract_text() or ""
+                if "BARB0" in text or "BANK OF BARODA" in text.upper() or "SWASTIK TRADERS" in text.upper():
+                    console.print("  🏦 [bold green]Detected Bank of Baroda Statement format![/]")
+                    from bob_parser import parse_bank_statement_bob
+                    transactions = parse_bank_statement_bob(pdf_path, password=password, master_ledgers=master_ledgers)
+                    console.print(f"  📋 Total transactions extracted: [bold green]{len(transactions)}[/]")
+                    return transactions
+    except Exception as e:
+        console.print(f"  [yellow]Note: Error detecting BOB statement format: {e}[/]")
+
     tables = extract_tables_from_pdf(pdf_path, password=password)
 
     if not tables:
@@ -630,7 +647,52 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
             txns, last_balance = parse_multiline_table(data_rows, column_mapping, prev_balance=last_balance, master_ledgers=master_ledgers)
             transactions.extend(txns)
         else:
+            # Helper defined once per table (not inside the loop)
+            def get_cell_raw(r, col_name):
+                idx = column_mapping.get(col_name, -1)
+                if idx < 0 or idx >= len(r):
+                    return ''
+                return str(r[idx]).strip() if r[idx] else ''
+
             for row in data_rows:
+                # ── Continuation-row detection ──────────────────────────────
+                # A continuation row has no date and no debit/credit amount
+                # but carries text in the narration column. pdfplumber creates
+                # these when a long narration wraps inside a PDF table cell and
+                # the PDF has no explicit row border for that continuation line.
+                # Without this merge the party/payee name is silently lost,
+                # causing the wrong ledger to be assigned to the transaction.
+                if row is not None:
+                    row_date   = get_cell_raw(row, 'date')
+                    row_debit  = get_cell_raw(row, 'debit')
+                    row_credit = get_cell_raw(row, 'credit')
+                    row_nar    = get_cell_raw(row, 'narration')
+
+                    is_continuation = (
+                        not parse_date(row_date)
+                        and clean_amount(row_debit) == 0.0
+                        and clean_amount(row_credit) == 0.0
+                        and bool(row_nar)
+                        and transactions
+                    )
+
+                    if is_continuation:
+                        prev = transactions[-1]
+                        merged_nar = clean_narration(prev.narration + ' ' + row_nar)
+                        if master_ledgers:
+                            vtype, contra = reconcile_transaction(
+                                merged_nar, prev.is_debit, master_ledgers,
+                                amount=prev.amount
+                            )
+                        else:
+                            vtype  = prev.voucher_type
+                            contra = guess_contra_ledger(merged_nar, prev.is_debit)
+                        prev.narration     = merged_nar
+                        prev.voucher_type  = vtype
+                        prev.contra_ledger = contra
+                        continue
+                # ────────────────────────────────────────────────────────────
+
                 txn = _parse_standard_row(row, column_mapping, master_ledgers=master_ledgers)
                 if txn:
                     transactions.append(txn)
