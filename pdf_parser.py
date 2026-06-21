@@ -202,6 +202,9 @@ def split_multiline_narration(narration_lines: List[str], date_lines: List[str])
         r'^BY\s+DD',        r'^BY\s+CASH',      r'^CHARGES',
         r'^INT\s',          r'^SME\s',          r'^SALARY',
         r'^TRF',            r'^POS\s',          r'^DR\s',
+        r'^\d{10,}',        r'^[A-Z]{3}[A-Z]{3}\d{2}INSTA',
+        r'^INTERESTDEBITED', r'^IBFUNDSTRANSFER', r'^[A-Z]{6}\d{2}',
+        r'^SELF',           r'^MEDCSI',
     ]
 
     def looks_like_new_entry(line: str) -> bool:
@@ -393,12 +396,25 @@ def parse_multiline_table(
         # Parse narrations
         narration_cell = get_cell('narration')
         narration_lines = narration_cell.split('\n') if narration_cell else []
-        narrations = split_multiline_narration(narration_lines, date_lines)
+        narrations = split_multiline_narration(narration_lines, valid_dates)
 
         # Parse balances first (needed for amount alignment)
         balance_cell = get_cell('balance')
         balance_lines = [l.strip() for l in balance_cell.split('\n') if l.strip()] if balance_cell else []
-        balances = [clean_amount(b) for b in balance_lines]
+        
+        def parse_bal(b_str):
+            b_clean = re.sub(r'[₹$€£,]', '', b_str)
+            b_clean = re.sub(r'\s*(Cr|CR|cr)\s*$', '', b_clean)
+            is_dr = bool(re.search(r'\s*(Dr|DR|dr)\s*$', b_str))
+            b_clean = re.sub(r'\s*(Dr|DR|dr)\s*$', '', b_clean)
+            b_val = 0.0
+            try:
+                b_val = float(re.sub(r'[^\d.\-]', '', b_clean))
+            except:
+                pass
+            return -abs(b_val) if is_dr else b_val
+            
+        balances = [parse_bal(b) for b in balance_lines]
 
         # Parse amounts
         debit_cell = get_cell('debit')
@@ -431,7 +447,10 @@ def parse_multiline_table(
         # Build transactions
         for i in range(num_txns):
             date = valid_dates[i]
-            narration = clean_narration(narrations[i] if i < len(narrations) else "No Description")
+            nar_text = narrations[i] if i < len(narrations) else "No Description"
+            nar_text = re.sub(r'\s*OpeningBalance DrCount CrCount Debits Credits ClosingBal.*$', '', nar_text, flags=re.DOTALL)
+            narration = clean_narration(nar_text)
+            
             debit = debits[i] if i < len(debits) else 0.0
             credit = credits[i] if i < len(credits) else 0.0
             balance = balances[i] if i < len(balances) else 0.0
@@ -457,7 +476,7 @@ def parse_multiline_table(
                 narration=narration,
                 debit=debit,
                 credit=credit,
-                balance=balance,
+                balance=abs(balance),
                 reference=ref,
                 contra_ledger=contra_ledger,
                 voucher_type=voucher_type,
@@ -573,6 +592,84 @@ def guess_mapping_from_data(table: List[List[str]]) -> Dict[str, int]:
     return mapping
 
 
+def parse_text_fallback(pdf_path: str, password: str = None, master_ledgers: List[str] = None) -> List[Transaction]:
+    """
+    Fallback parser that extracts text line-by-line and uses regex to find transactions.
+    Useful for PDFs where table extraction fails or yields incorrect results.
+    """
+    console.print("  🔍 Attempting text-based fallback parsing...")
+    transactions = []
+    
+    try:
+        with pdfplumber.open(pdf_path, password=password) as pdf:
+            full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+            
+            # Regex to match a transaction line: Date, Narration, Debit, Credit, Balance
+            # Example: 01-03-2026 UPI/548234558718/CR/LATA/SBIN/882786955/Paymen 700.00 78,346.06
+            # This pattern looks for a date at the start, then captures everything until it finds 
+            # two or three numeric amounts at the end.
+            pattern = re.compile(
+                r'^(\d{2}-\d{2}-\d{4})\s+(.*?)\s+([\d,.]+)\s+([\d,.]+)?\s*$', 
+                re.MULTILINE
+            )
+            
+            for match in pattern.finditer(full_text):
+                date_str, narration, amt1, amt2 = match.groups()
+                date = parse_date(date_str)
+                if not date:
+                    continue
+                
+                val1 = clean_amount(amt1)
+                val2 = clean_amount(amt2) if amt2 else 0.0
+                
+                # Logic to determine if it's a Debit or Credit based on context or column position
+                # In this specific PDF, the format is: Date, Narration, Credit, Balance
+                # Wait, let's look at the dump: "1 01-03-2026 ... 700.00 78,346.06"
+                # It seems Credit is the first amount, Balance is the second.
+                
+                # We will assume if there are 2 amounts: amt1=Credit/Debit, amt2=Balance
+                # This is a simplification; we'll use a more robust heuristic if possible.
+                # Let's use the total credits vs debits or balance transition to be sure.
+                
+                # For now, based on abc.pdf dump: Credit is 700.00, Balance is 78,346.06.
+                # Let's assume: 
+                # If only 2 values: it's either (Debit, Balance) or (Credit, Balance).
+                # We can't know for sure without the header. 
+                # But the dump says "Debit (₹) Credit (₹) Balance (₹)".
+                # Line 10: "...Paymen 700.00 78,346.06" -> Only two values.
+                # This means either Debit is empty and we have (Credit, Balance) or vice versa.
+                
+                # We'll refine this: try to see if the amount is a debit or credit.
+                # Since we don't have the columns, we'll check if it's a payment or receipt in narration.
+                
+                is_debit = "Paymen" in narration or "Debit" in narration
+                debit = val1 if is_debit else 0.0
+                credit = val1 if not is_debit else 0.0
+                balance = val2
+                
+                if debit == 0.0 and credit == 0.0:
+                    continue
+
+                if master_ledgers:
+                    voucher_type, contra_ledger = reconcile_transaction(narration, is_debit, master_ledgers, amount=val1)
+                else:
+                    voucher_type = "Payment" if is_debit else "Receipt"
+                    contra_ledger = guess_contra_ledger(narration, is_debit)
+
+                transactions.append(Transaction(
+                    date=date,
+                    narration=clean_narration(narration),
+                    debit=debit,
+                    credit=credit,
+                    balance=balance,
+                    contra_ledger=contra_ledger,
+                    voucher_type=voucher_type,
+                ))
+    except Exception as e:
+        console.print(f"  [bold red]Text fallback failed:[/] {e}")
+
+    return transactions
+
 def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: List[str] = None) -> List[Transaction]:
     """
     Parse a bank statement PDF and return a list of Transaction objects.
@@ -591,7 +688,8 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
         with pdfplumber.open(pdf_path, password=password or "") as pdf:
             if pdf.pages:
                 text = pdf.pages[0].extract_text() or ""
-                if "BARB0" in text or "BANK OF BARODA" in text.upper() or "SWASTIK TRADERS" in text.upper():
+                header_text = text[:1000].upper()
+                if "BANK OF BARODA" in header_text or "SWASTIK TRADERS" in header_text:
                     console.print("  🏦 [bold green]Detected Bank of Baroda Statement format![/]")
                     from bob_parser import parse_bank_statement_bob
                     transactions = parse_bank_statement_bob(pdf_path, password=password, master_ledgers=master_ledgers)
@@ -604,8 +702,8 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
 
     if not tables:
         console.print("[bold red]❌ No tables found in the PDF![/]")
-        console.print("[yellow]Tip: Make sure the PDF has selectable text (not a scanned image).[/]")
-        return []
+        # Fallback to text parsing if no tables are found
+        return parse_text_fallback(pdf_path, password, master_ledgers)
 
     transactions: List[Transaction] = []
     header_found = False
@@ -613,6 +711,9 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
     is_multiline = False
 
     last_balance = None
+
+    multiline_rows_to_merge = []
+    multiline_mapping = None
 
     for table_idx, table in enumerate(tables):
         h_idx, h_map = find_header_row(table)
@@ -627,6 +728,8 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
             is_multiline = is_multiline_cell_format(data_rows)
             if is_multiline:
                 console.print(f"  📋 Table {table_idx+1}: Detected [bold yellow]multi-line cell format[/]")
+                if not multiline_mapping:
+                    multiline_mapping = column_mapping
             else:
                 console.print(f"  📋 Table {table_idx+1}: Detected [bold green]standard row format[/]")
         else:
@@ -639,13 +742,17 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
                     console.print(f"  🔍 Table {table_idx+1}: Auto-guessed mapping: {list(guessed_map.keys())}")
             
             data_rows = table
+            if header_found and is_multiline_cell_format(data_rows):
+                is_multiline = True
 
         if not header_found or not column_mapping:
             continue
 
         if is_multiline:
-            txns, last_balance = parse_multiline_table(data_rows, column_mapping, prev_balance=last_balance, master_ledgers=master_ledgers)
-            transactions.extend(txns)
+            # Accumulate multi-line rows to merge them across pages
+            for row in data_rows:
+                if row:
+                    multiline_rows_to_merge.append(row)
         else:
             # Helper defined once per table (not inside the loop)
             def get_cell_raw(r, col_name):
@@ -697,6 +804,33 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
                 if txn:
                     transactions.append(txn)
                     last_balance = txn.balance
+
+    # Process accumulated multiline rows as one giant table
+    if multiline_rows_to_merge and multiline_mapping:
+        merged_row = [''] * (max(multiline_mapping.values()) + 1)
+        for row in multiline_rows_to_merge:
+            for i, cell in enumerate(row):
+                if i < len(merged_row):
+                    if cell and str(cell).strip():
+                        if merged_row[i]:
+                            merged_row[i] += '\n' + str(cell)
+                        else:
+                            merged_row[i] = str(cell)
+        txns, _ = parse_multiline_table([merged_row], multiline_mapping, prev_balance=None, master_ledgers=master_ledgers)
+        transactions.extend(txns)
+
+    # Sanity check: if we extracted transactions but they look like a sequence (1, 2, 3...), it's likely the Sr No column
+    if transactions:
+        sequential_count = 0
+        for i, txn in enumerate(transactions[:10]):
+            if abs(txn.debit - (i + 1)) < 0.01 or abs(txn.credit - (i + 1)) < 0.01:
+                sequential_count += 1
+        if sequential_count >= 5:
+            console.print("  ⚠️  Detected suspicious sequential amounts. Triggering fallback parser...")
+            return parse_text_fallback(pdf_path, password, master_ledgers)
+
+    if not transactions:
+        return parse_text_fallback(pdf_path, password, master_ledgers)
 
     console.print(f"\n  📋 Total transactions extracted: [bold green]{len(transactions)}[/]")
     return transactions

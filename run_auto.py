@@ -19,9 +19,9 @@ from ledger_extractor import extract_ledger_names
 console = Console()
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-PDF_PATH      = "OpTransactionHistoryUX502-06-2026.pdf"
-PDF_PASSWORD  = None 
-MASTER_PDF    = "Master.pdf"
+PDF_PATH      = "Acct Statement_2591_05062026_12.56.58.pdf"
+PDF_PASSWORD  = "309622234"
+MASTER_PDF    = "Master-2.pdf"
 # ─────────────────────────────────────────────────────────────────────────────
 
 console.print(Panel("🏦  TALLY BANK STATEMENT AUTOMATOR  🏦", style="bold blue"))
