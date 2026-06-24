@@ -23,7 +23,7 @@ def create_voucher_element(txn: Transaction, bank_ledger: str, vnum: int) -> ET.
 
     ET.SubElement(v, "DATE").text = txn.tally_date
     ET.SubElement(v, "VOUCHERTYPENAME").text = txn.voucher_type
-    ET.SubElement(v, "VOUCHERNUMBER").text = str(vnum)
+
     if txn.reference:
         ET.SubElement(v, "REFERENCE").text = txn.reference
     ET.SubElement(v, "NARRATION").text = txn.narration

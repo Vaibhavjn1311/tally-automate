@@ -214,13 +214,10 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
 
     # 2. Cash Check -> Contra Voucher (Only for pure cash movement)
     is_cash = False
-    # If it contains "CHARGES" or "CHG", it was already handled above.
     if any(kw in nar_compact for kw in ['CASHWDL', 'CASHDEP', 'CASHPOSIT', 'CASHWITH', 'BYCASH', 'TOCASH', 'ATMCASH', 'ATMWDL', 'CASH8845SELF', 'CASHDEPOSIT', 'CASHDEPOSITBY', 'ATMTXN', 'ATMDEBIT']):
         is_cash = True
-    elif 'CASH' in nar_compact:
-        # Avoid marking as cash if it's a "CASHBACK" or similar unless it's clearly a deposit/withdrawal
-        if 'CASHBACK' not in nar_upper:
-            is_cash = True
+    elif 'CASH' in nar_compact and 'CASHBACK' not in nar_upper:
+        is_cash = True
     elif is_debit and 'SELF' in nar_compact:
         is_cash = True
 
@@ -228,22 +225,6 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
         cash_ledger = next((l for l in master_ledgers if l.upper() == 'CASH'), None)
         if cash_ledger:
             return 'Contra', cash_ledger
-
-    # 3. PhonePe / UPI Check -> Map to 'Phone Pyee' ONLY if it is a strong match. 
-    # To prevent over-matching, we can make this more restrictive or remove automatic mapping if desired.
-    # The user specifically requested not to default payments to these ledgers.
-    # We will ONLY map if narration contains 'PHONEPE' OR 'UPI', but restrict it to non-payment types if necessary,
-    # or just trust the master ledger check.
-    # Given the request, we should make it harder to hit 'Phone Pyee' for Payments.
-    
-    # Revised logic: Do not auto-map to 'Phone Pyee' for Payments unless very clear.
-    if is_debit and any(kw in nar_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE']):
-        # If it's a payment, force to suspense 'A' unless we have a strong match later
-        pass
-    elif any(kw in nar_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'PAYMENTFROMPH', 'TERMINAL1', 'CARDSSETTL', 'UPSETTL', 'UPISETTL', 'DDS615']):
-        phone_led = next((l for l in master_ledgers if l.upper() in ['PHONE PYEE', 'PHONEPE', 'PHONE PAY', 'PHONEPE PRIVATELIMI']), None)
-        if phone_led:
-            return default_voucher, phone_led
 
     # 3. Enhanced Ledger Matching Logic
     IGNORE_WORDS = {
@@ -258,7 +239,6 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
         'BANK', 'BANKS', 'A/C', 'ACCOUNTS', 'LEDGER', 'LEDGERS', 'STATE', 'CENTRAL', 'OF', 'THE', 'AND'
     }
 
-    # Tokenize narration
     nar_tokens = [w for w in re.split(r'[^A-Z0-9]', nar_upper) if w]
     nar_norms = [phonetic_normalize(w) for w in nar_tokens]
 
@@ -266,11 +246,16 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
     max_score = 0
 
     for led in master_ledgers:
-        if led.upper() in ['A', 'CASH', 'PROFIT & LOSS', 'PROFIT & LOSS A/C']:
-            continue
-
         led_upper = led.upper()
-        # Tokenize ledger name - exclude digit-only and ignored words
+        if led_upper in ['A', 'CASH', 'PROFIT & LOSS', 'PROFIT & LOSS A/C']:
+            continue
+            
+        # Prevent payments from matching into PhonePe / UPI Sales ledgers
+        if is_debit:
+            lu_compact = re.sub(r'[^A-Z0-9]', '', led_upper)
+            if any(kw in lu_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'GPAY', 'PAYTM']) or 'UPI' in led_upper.split():
+                continue
+
         led_tokens = [
             w for w in re.split(r'[^A-Z0-9]', led_upper) 
             if w and w not in IGNORE_WORDS and len(w) >= 3 and not w.isdigit()
@@ -283,8 +268,6 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
 
         for lt in led_tokens:
             lt_norm = phonetic_normalize(lt)
-            
-            # Find best matching token in narration
             best_sim = 0.0
             for nt_norm in nar_norms:
                 sim = token_similarity(lt_norm, nt_norm)
@@ -303,14 +286,30 @@ def reconcile_transaction(narration: str, is_debit: bool, master_ledgers: list, 
                 max_score = score
                 best_match = led
 
+    # Strict confidence requirement (must be >= 80 to be accepted)
     if best_match and max_score >= 80:
         return default_voucher, best_match
 
-    # 4. UPI/Digital Payment Fallback -> Phone Pyee
-    if any(kw in nar_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'UPI', 'MBK', 'GPAY', 'PAYTM', 'IMPS']):
-        phone_led = next((l for l in master_ledgers if l.upper() in ['PHONE PYEE', 'PHONEPE', 'PHONE PAY', 'PHONEPE PRIVATELIMI']), None)
-        if phone_led:
-            return default_voucher, phone_led
+    # 4. Digital Payment Fallback (Receipts ONLY)
+    if not is_debit:
+        digital_kws = ['UPI', 'GPAY', 'GOOGLEPAY', 'PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'PAYTM', 'BHIM', 'MBK']
+        is_digital_receipt = any(kw in nar_compact for kw in digital_kws) or 'UPI' in nar_upper.split()
+        
+        if is_digital_receipt:
+            # Look for a ledger designed for digital payments
+            dig_ledgers = []
+            for led in master_ledgers:
+                lu_compact = re.sub(r'[^A-Z0-9]', '', led.upper())
+                # Exclude regular banks, looking for digital payment gateways/sales
+                if any(kw in lu_compact for kw in ['PHONEPE', 'PHONEPAY', 'PHONEPYEE', 'GPAY', 'PAYTM', 'BHIM']) or 'UPI' in led.upper().split():
+                    dig_ledgers.append(led)
+            
+            if dig_ledgers:
+                # Prefer ledgers with 'SALES' or 'ACCOUNT' in the name if possible
+                sales_dig_ledgers = [l for l in dig_ledgers if 'SALE' in l.upper()]
+                if sales_dig_ledgers:
+                    return default_voucher, sales_dig_ledgers[0]
+                return default_voucher, dig_ledgers[0]
 
     # 5. Default Fallback -> Ledger "A" (Suspense)
     return default_voucher, a_ledger
