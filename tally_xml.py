@@ -9,14 +9,45 @@ from typing import List
 from transaction import Transaction
 from rich.console import Console
 import csv
+import hashlib
+import re
 
 console = Console()
+
+
+def _generate_unique_remote_id(txn: Transaction, bank_ledger: str, vnum: int) -> str:
+    """
+    Generate a unique REMOTEID for each voucher that is stable and unique
+    across different bank statements.
+
+    The REMOTEID is built from:
+      - A short hash of the bank ledger name (identifies which bank account)
+      - The transaction date (YYYYMMDD)
+      - The transaction amount
+      - A short hash of the narration (for uniqueness within same date/amount)
+      - The sequential number as a final tiebreaker
+
+    This ensures that importing XMLs from different banks (or different
+    statements of the same bank) will never have colliding REMOTEIDs.
+    """
+    # Create a stable identifier from bank ledger
+    ledger_hash = hashlib.md5(bank_ledger.encode('utf-8')).hexdigest()[:6].upper()
+
+    # Create a hash from narration + reference for uniqueness
+    narration_key = f"{txn.narration}|{txn.reference}"
+    narration_hash = hashlib.md5(narration_key.encode('utf-8')).hexdigest()[:6].upper()
+
+    # Build the REMOTEID: BankImport-<LedgerHash>-<Date>-<Amount>-<NarHash>-<Seq>
+    amount_str = f"{txn.amount:.2f}".replace('.', 'D')
+    remote_id = f"BankImport-{ledger_hash}-{txn.tally_date}-{amount_str}-{narration_hash}-{vnum}"
+
+    return remote_id
 
 
 def create_voucher_element(txn: Transaction, bank_ledger: str, vnum: int) -> ET.Element:
     """Create a VOUCHER XML element for a transaction."""
     v = ET.Element("VOUCHER")
-    v.set("REMOTEID", f"BankImport-{vnum}")
+    v.set("REMOTEID", _generate_unique_remote_id(txn, bank_ledger, vnum))
     v.set("VCHTYPE", txn.voucher_type)
     v.set("ACTION", "Create")
     v.set("OBJVIEW", "Accounting Voucher View")
