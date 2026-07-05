@@ -683,13 +683,19 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
         console.print(f"  📚 Using [bold cyan]{len(master_ledgers)}[/] master ledgers for reconciliation")
 
     # Detect and route BOB statements
+    # NOTE: We must check for Axis Bank indicators FIRST, because Axis Bank
+    # statements may contain "BANK OF BARODA" in transaction narrations.
     try:
         import pdfplumber
         with pdfplumber.open(pdf_path, password=password or "") as pdf:
             if pdf.pages:
                 text = pdf.pages[0].extract_text() or ""
                 header_text = text[:1000].upper()
-                if "BANK OF BARODA" in header_text or "SWASTIK TRADERS" in header_text:
+                # Check if this is an Axis Bank statement (should NOT be routed to BOB)
+                is_axis = any(kw in header_text for kw in [
+                    'AXIS BANK', 'STATEMENT OF AXIS ACCOUNT', 'UTIB',
+                ])
+                if not is_axis and ("BANK OF BARODA" in header_text or "SWASTIK TRADERS" in header_text):
                     console.print("  🏦 [bold green]Detected Bank of Baroda Statement format![/]")
                     from bob_parser import parse_bank_statement_bob
                     transactions = parse_bank_statement_bob(pdf_path, password=password, master_ledgers=master_ledgers)

@@ -9,6 +9,7 @@ from rich.console import Console
 from ledger_extractor import extract_ledger_names
 from pdf_parser import parse_bank_statement
 from bob_parser import parse_bank_statement_bob
+from axis_parser import parse_bank_statement_axis
 from tally_xml import generate_tally_xml, generate_csv_report
 
 st.set_page_config(page_title="Tally Bank Statement Automator", page_icon="🏦", layout="wide")
@@ -23,7 +24,7 @@ def main():
         st.header("Settings")
         bank_option = st.selectbox(
             "Select Bank Format",
-            ["Generic / HDFC", "Bank of Baroda"],
+            ["Generic / HDFC", "Bank of Baroda", "Axis Bank"],
             index=0
         )
         
@@ -71,6 +72,8 @@ def main():
                     # Step 1: Parse Statement
                     if bank_option == "Bank of Baroda":
                         transactions = parse_bank_statement_bob(stmt_path, password=password, master_ledgers=master_ledgers)
+                    elif bank_option == "Axis Bank":
+                        transactions = parse_bank_statement_axis(stmt_path, password=password, master_ledgers=master_ledgers)
                     else:
                         transactions = parse_bank_statement(stmt_path, password=password, master_ledgers=master_ledgers)
 
