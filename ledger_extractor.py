@@ -20,6 +20,8 @@ def extract_ledger_names(pdf_path: str) -> list[str]:
     }
 
     ledgers = []
+    active_groups = {}  # Tracks group hierarchy based on x0
+
     try:
         with pdfplumber.open(pdf_path) as pdf:
             # Detect company name from the very first line of the first page
@@ -50,6 +52,19 @@ def extract_ledger_names(pdf_path: str) -> list[str]:
                     # Leftmost coordinate
                     first_x0 = line_words[0]['x0']
 
+                    # Skip headers and metadata usually placed on the far right
+                    if first_x0 > 150.0:
+                        continue
+                        
+                    # Update active groups based on x0 indentation
+                    active_groups[first_x0] = line_text
+                    keys_to_remove = [k for k in active_groups if k > first_x0]
+                    for k in keys_to_remove:
+                        del active_groups[k]
+                        
+                    # Determine parent groups for the current line
+                    parents = [active_groups[k].lower() for k in active_groups if k < first_x0]
+
                     # Skip company name and other header/footer metadata
                     if company_name and line_text.lower() == company_name.lower():
                         continue
@@ -68,6 +83,10 @@ def extract_ledger_names(pdf_path: str) -> list[str]:
 
                     # If it's a known group at x0=49.0, exclude it
                     if line_text.lower() in GROUPS_TO_EXCLUDE:
+                        continue
+                        
+                    # Skip ledgers under Purchase Accounts or Sales Accounts
+                    if any(p in {'purchase accounts', 'sales accounts'} for p in parents):
                         continue
 
                     # Skip short trash lines
@@ -113,8 +132,8 @@ def detect_bank_ledger(pdf_path: str, master_ledgers: list[str], password: str =
                 if d not in potential_acc_nos:
                     potential_acc_nos.append(d)
             
-            matches = []
             for raw_acc in potential_acc_nos:
+                matches = []
                 acc_clean = raw_acc.upper().replace('X', r'\d').replace('*', r'\d').replace('-', '')
                 
                 try:
@@ -143,11 +162,11 @@ def detect_bank_ledger(pdf_path: str, master_ledgers: list[str], password: str =
                             if led_digs and (digits_only in led_digs or led_digs in digits_only):
                                 matches.append(led)
             
-            if matches:
-                # Sort matches: prefer those starting with 'BOB ' (with space) or without '-'
-                # to avoid choosing header metadata like 'BOB -11960200000154'
-                matches_sorted = sorted(list(set(matches)), key=lambda x: (not x.startswith('BOB '), '-' in x, len(x)))
-                return matches_sorted[0]
+                if matches:
+                    # Sort matches: prefer those starting with 'BOB ' (with space) or without '-'
+                    # to avoid choosing header metadata like 'BOB -11960200000154'
+                    matches_sorted = sorted(list(set(matches)), key=lambda x: (not x.startswith('BOB '), '-' in x, len(x)))
+                    return matches_sorted[0]
                             
     except Exception as e:
         print(f"Error detecting bank ledger: {e}")

@@ -489,6 +489,239 @@ def parse_multiline_table(
     return transactions, current_balance
 
 
+def parse_wordlevel_multiline(
+    pdf_path: str,
+    password: str = None,
+    master_ledgers: List[str] = None,
+    column_mapping: Dict[str, int] = None,
+) -> List[Transaction]:
+    """
+    Parse a multi-line cell format PDF using word-level y-coordinate alignment.
+
+    Instead of relying on text heuristics to split merged narration lines,
+    this function uses the horizontal ruling lines **inside** the table to
+    create physical sub-rows. Each sub-row that contains a date in the date
+    column starts a new transaction; sub-rows without a date are treated as
+    continuations of the previous transaction's narration.
+
+    This eliminates the narration/ledger "one-line-shift" problem that
+    occurs when ``split_multiline_narration`` misidentifies continuation
+    lines vs. new-entry lines.
+    """
+    transactions: List[Transaction] = []
+
+    # Standard column name -> positional index in col_bounds list.
+    # We'll build this from the detected vertical column lines.
+    COL_NAMES = ['date', 'narration', 'reference', 'value_date', 'debit', 'credit', 'balance']
+
+    try:
+        open_kwargs = {}
+        if password:
+            open_kwargs["password"] = password
+        with pdfplumber.open(pdf_path, **open_kwargs) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                tables_found = page.find_tables({
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                    "snap_tolerance": 5,
+                    "join_tolerance": 5,
+                    "edge_min_length": 10,
+                })
+
+                if not tables_found:
+                    continue
+
+                t = tables_found[0]
+                table_bbox = t.bbox  # (x0, top, x1, bottom)
+
+                # Collect horizontal lines inside the table
+                edges = page.edges
+                h_lines = sorted(set(
+                    round(e['top']) for e in edges
+                    if abs(e['top'] - e['bottom']) < 2
+                    and e['x0'] >= table_bbox[0] - 5
+                    and e['x1'] <= table_bbox[2] + 5
+                    and e['top'] >= table_bbox[1] - 5
+                    and e['top'] <= table_bbox[3] + 5
+                ))
+
+                # Collect vertical lines to identify column boundaries
+                v_lines = sorted(set(
+                    round(e['x0']) for e in edges
+                    if abs(e['x0'] - e['x1']) < 2
+                    and e['top'] >= table_bbox[1] - 5
+                    and e['bottom'] <= table_bbox[3] + 5
+                ))
+
+                # Merge close vertical lines (double-ruled borders)
+                merged_v: List[float] = []
+                for v in v_lines:
+                    if merged_v and abs(v - merged_v[-1]) < 5:
+                        merged_v[-1] = (merged_v[-1] + v) / 2
+                    else:
+                        merged_v.append(v)
+
+                if len(merged_v) < 2 or len(h_lines) < 3:
+                    continue
+
+                col_bounds = [(merged_v[i], merged_v[i + 1]) for i in range(len(merged_v) - 1)]
+
+                # Map column bounds to standard names based on count and
+                # the column_mapping passed from the header detection.
+                # Default mapping assumes 7 columns in HDFC order.
+                col_name_map: Dict[str, int] = {}
+                if column_mapping and col_bounds:
+                    # Use the detected header mapping to identify which
+                    # positional index in col_bounds corresponds to each
+                    # standard column name.
+                    num_detected_cols = max(column_mapping.values()) + 1
+                    if len(col_bounds) >= num_detected_cols:
+                        col_name_map = column_mapping
+                    else:
+                        # Fall back to order-based mapping
+                        for idx, name in enumerate(COL_NAMES):
+                            if idx < len(col_bounds):
+                                col_name_map[name] = idx
+                elif len(col_bounds) >= 7:
+                    for idx, name in enumerate(COL_NAMES):
+                        col_name_map[name] = idx
+                elif len(col_bounds) >= 5:
+                    # Minimal mapping: date, narration, debit, credit, balance
+                    col_name_map = {
+                        'date': 0, 'narration': 1,
+                        'debit': len(col_bounds) - 3,
+                        'credit': len(col_bounds) - 2,
+                        'balance': len(col_bounds) - 1,
+                    }
+
+                if 'date' not in col_name_map:
+                    continue
+
+                words = page.extract_words()
+
+                # Build sub-rows between consecutive horizontal lines
+                sub_rows: List[List[str]] = []
+                for i in range(len(h_lines) - 1):
+                    band_top = h_lines[i]
+                    band_bottom = h_lines[i + 1]
+                    if band_bottom - band_top < 5:
+                        continue
+
+                    band_words = [
+                        w for w in words
+                        if w['top'] >= band_top - 2
+                        and w['bottom'] <= band_bottom + 2
+                    ]
+
+                    row_cells: List[str] = []
+                    for cx0, cx1 in col_bounds:
+                        col_words = [
+                            w for w in band_words
+                            if w['x0'] >= cx0 - 3 and w['x1'] <= cx1 + 3
+                        ]
+                        col_text = ' '.join(
+                            w['text'] for w in sorted(col_words, key=lambda w: (w['top'], w['x0']))
+                        ) if col_words else ''
+                        row_cells.append(col_text.strip())
+                    sub_rows.append(row_cells)
+
+                # Group sub-rows into transactions: a sub-row with a valid
+                # date starts a new transaction; otherwise it is a continuation.
+                raw_txns: List[dict] = []
+                current_txn: Optional[dict] = None
+
+                date_col = col_name_map.get('date', 0)
+                nar_col = col_name_map.get('narration', 1)
+                ref_col = col_name_map.get('reference', -1)
+                debit_col = col_name_map.get('debit', -1)
+                credit_col = col_name_map.get('credit', -1)
+                balance_col = col_name_map.get('balance', -1)
+
+                def _cell(sr: List[str], idx: int) -> str:
+                    if idx < 0 or idx >= len(sr):
+                        return ''
+                    return sr[idx]
+
+                for sr in sub_rows:
+                    date_text = _cell(sr, date_col)
+                    nar_text = _cell(sr, nar_col)
+
+                    # Skip header-like rows
+                    if any(kw in date_text for kw in ['Date', 'date', 'DATE']):
+                        continue
+                    if any(kw in nar_text for kw in ['Narration', 'narration', 'NARRATION', 'Particulars']):
+                        continue
+
+                    dt = parse_date(date_text)
+                    if dt:
+                        # Start a new transaction
+                        if current_txn is not None:
+                            raw_txns.append(current_txn)
+                        current_txn = {
+                            'date': dt,
+                            'narration_parts': [nar_text] if nar_text else [],
+                            'debit_text': _cell(sr, debit_col),
+                            'credit_text': _cell(sr, credit_col),
+                            'balance_text': _cell(sr, balance_col),
+                            'ref_text': _cell(sr, ref_col),
+                        }
+                    elif current_txn is not None:
+                        # Continuation row
+                        if nar_text:
+                            current_txn['narration_parts'].append(nar_text)
+                        # Pick up amount if this sub-row has one and the
+                        # transaction doesn't have one yet
+                        dr_text = _cell(sr, debit_col)
+                        cr_text = _cell(sr, credit_col)
+                        if dr_text and not current_txn['debit_text']:
+                            current_txn['debit_text'] = dr_text
+                        if cr_text and not current_txn['credit_text']:
+                            current_txn['credit_text'] = cr_text
+
+                if current_txn is not None:
+                    raw_txns.append(current_txn)
+
+                # Convert raw dicts to Transaction objects
+                for rt in raw_txns:
+                    narration = clean_narration(' '.join(rt['narration_parts']))
+                    debit = clean_amount(rt['debit_text'])
+                    credit = clean_amount(rt['credit_text'])
+                    balance = clean_amount(rt['balance_text'])
+
+                    if debit == 0.0 and credit == 0.0:
+                        continue
+
+                    is_debit = debit > 0
+
+                    if master_ledgers:
+                        voucher_type, contra_ledger = reconcile_transaction(
+                            narration, is_debit, master_ledgers, amount=(debit or credit)
+                        )
+                    else:
+                        from transaction import guess_contra_ledger as _guess
+                        voucher_type = "Payment" if is_debit else "Receipt"
+                        contra_ledger = _guess(narration, is_debit)
+
+                    txn = Transaction(
+                        date=rt['date'],
+                        narration=narration,
+                        debit=debit,
+                        credit=credit,
+                        balance=balance,
+                        reference=rt.get('ref_text', ''),
+                        contra_ledger=contra_ledger,
+                        voucher_type=voucher_type,
+                    )
+                    transactions.append(txn)
+
+    except Exception as e:
+        console.print(f"  [bold red]Word-level multiline parsing error:[/] {e}")
+        import traceback
+        traceback.print_exc()
+
+    return transactions
+
+
 def find_header_row(table: List[List[str]]) -> Tuple[int, Dict[str, int]]:
     """Find the header row in a table by looking for known column name patterns."""
     for row_idx, row in enumerate(table):
@@ -736,6 +969,21 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
                 console.print(f"  📋 Table {table_idx+1}: Detected [bold yellow]multi-line cell format[/]")
                 if not multiline_mapping:
                     multiline_mapping = column_mapping
+                    # Use word-level parsing for the entire PDF and stop
+                    # accumulating rows from the old approach.
+                    console.print("  🔬 Switching to word-level multiline parser for accurate narration alignment...")
+                    wl_txns = parse_wordlevel_multiline(
+                        pdf_path, password=password,
+                        master_ledgers=master_ledgers,
+                        column_mapping=column_mapping,
+                    )
+                    if wl_txns:
+                        transactions.extend(wl_txns)
+                        # Skip the rest of the table-iteration loop; word-level
+                        # parser already processed all pages.
+                        break
+                    else:
+                        console.print("  ⚠️  Word-level parser returned 0 transactions, falling back to text-split approach.")
             else:
                 console.print(f"  📋 Table {table_idx+1}: Detected [bold green]standard row format[/]")
         else:
@@ -756,6 +1004,7 @@ def parse_bank_statement(pdf_path: str, password: str = None, master_ledgers: Li
 
         if is_multiline:
             # Accumulate multi-line rows to merge them across pages
+            # (only reached if word-level parser failed above)
             for row in data_rows:
                 if row:
                     multiline_rows_to_merge.append(row)
